@@ -1,0 +1,135 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: ibm-img-enforce
+  annotations:
+    description: Runs an image to install ibmcloud-image-enforcement. (CISE)
+    app.openshift.io/description: Runs an image to install ibmcloud-image-enforcement
+    app.openshift.io/vcs-uri: https://github.com/IBM/ibm-garage-tekton-tasks
+    app.openshift.io/vcs-ref: master
+  labels:
+    version: 0.0.0
+spec:
+  params:
+    - name: image-url
+      description: "The location of image to scan on IBM Container Registry <server>/<namespace>/<repository>:<tag>"
+      default: ""
+    - name: scan-image
+      description: Flag indicating that a scan should be performed
+      default: "false"
+    - default: 'garagecatalyst/ibmcloud-dev:1.1.3'
+      name: tools-image
+      type: string      
+    - default: ""
+      name: image-namespace
+      type: string
+    - default: ""
+      name: image-server
+      type: string      
+    - default: ""
+      name: app-name
+      type: string
+    - default: ""
+      name: image-release
+      type: string
+    - default: ""
+      name: image-repository
+      type: string       
+  volumes:
+    - name: oci-image
+      emptyDir: {}
+  steps:
+    - name: install-cise
+      image: $(params.tools-image)
+      env:
+        - name: REGISTRY_USER
+          valueFrom:
+            secretKeyRef:
+              name: ibmcloud-apikey
+              key: REGISTRY_USER
+              optional: true
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ibmcloud-apikey
+              key: APIKEY
+              optional: true
+        - name: KP_PUBLIC
+          valueFrom:
+            secretKeyRef:
+              name: keyprotect-publickey
+              key: publicKey
+              optional: true
+        - name: KEYPROTECT_WRAP_PUBLIC
+          valueFrom:
+            secretKeyRef:
+              name: keyprotect-wrap-public
+              key: publicKey
+              optional: true
+        - name: KEYPROTECT_WRAP_PRIVATE
+          valueFrom:
+            secretKeyRef:
+              name: keyprotect-wrap-private
+              key: privateKey
+              optional: true
+        - name: IBM_CLOUD_APIKEY
+          valueFrom:
+            secretKeyRef:
+              key: APIKEY
+              name: ibmcloud-apikey
+              optional: true
+        - name: IBM_CLOUD_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: ibmcloud-config
+              key: REGION
+              optional: true              
+      volumeMounts:
+        - mountPath: /var/oci
+          name: oci-image
+      securityContext:
+        privileged: true
+      script: |
+        #!/bin/bash
+        KEY_NAME=$(params.image-namespace)
+        ibmcloud plugin install key-protect -r "IBM Cloud"
+        ibmcloud login --apikey ${IBM_CLOUD_APIKEY} -r ${IBM_CLOUD_REGION}
+        helm init --client-only 1> /dev/null 2> /dev/null
+        helm version --client
+        helm repo add iks-charts https://icr.io/helm/iks-charts
+        helm status cise || helm install --name cise iks-charts/ibmcloud-image-enforcement
+        
+        APP_IMAGE="$(params.image-server)/$(params.image-namespace)"
+        echo ${APP_IMAGE}
+
+        cat <<EOF >./securityPolicy.yaml
+        apiVersion: securityenforcement.admission.cloud.ibm.com/v1beta1
+        kind: ImagePolicy
+        metadata:
+          name: ibmcloud-$(params.app-name)-image-enforce-policy
+        spec:
+          repositories:
+            - name: ${APP_IMAGE}/*
+              policy:
+              trust:
+                  enabled: true
+                  signerSecrets:
+                  - name: keyprotect-publickey
+              va:
+                  enabled: false
+        EOF
+        cat securityPolicy.yaml
+        #kubectl get ImagePolicy -n $(params.image-namespace) ibmcloud-$(params.app-name)-image-enforce-policy | kubectl delete ImagePolicy -n $(params.image-namespace) ibmcloud-$(params.app-name)-image-enforce-policy
+        kubectl apply -f securityPolicy.yaml -n $(params.image-namespace) 
+        kubectl get ImagePolicy -n $(params.image-namespace)
+        kubectl get ClusterImagePolicy
+        REGISTRY_SERVER_FROM=$(echo "$(params.image-server)" | awk -F : '{print $1}')
+        mkdir -p /etc/docker/certs.d/$(params.image-server)
+        kubectl delete configmap registry-cas -n openshift-config --ignore-not-found
+        kubectl get pod -n openshift-image-registry | grep node | awk '{print $1}' | tail -1
+        REGISTRY_POD=$(kubectl get pod -n openshift-image-registry | grep node | awk '{print $1}' | tail -1)
+        echo " Registry POD ${REGISTRY_POD}"
+        kubectl cp -n openshift-image-registry ${REGISTRY_POD}:/etc/docker/certs.d/$(params.image-server)/ca.crt ca.crt
+        ls -lrth
+        kubectl create configmap registry-cas -n openshift-config --from-file=${REGISTRY_SERVER_FROM}..5000=ca.crt
+        kubectl patch image.config.openshift.io/cluster --patch '{"spec":{"additionalTrustedCA":{"name":"registry-cas"}}}' --type=merge

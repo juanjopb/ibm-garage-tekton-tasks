@@ -194,7 +194,8 @@ spec:
         fi
         if [[ -z "${REGISTRY_TAG}" ]]; then
           # Assume short git commit revision
-          REGISTRY_TAG="$(git rev-parse --verify HEAD --short)"
+          REGISTRY_TAG="$(git rev-parse --verify HEAD --short | tail -c 3)" 
+          #This was changed to avoid issues with the image deploy that keeps with extra Numbers "3233e6+9"
         fi
         echo -n "${REGISTRY_SERVER}">$(results.image-server.path)
         echo -n "${REGISTRY_NAMESPACE}">$(results.image-namespace.path)
